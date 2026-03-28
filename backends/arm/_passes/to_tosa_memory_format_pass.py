@@ -16,7 +16,6 @@ from executorch.backends.arm._passes.arm_pass_utils import (
 )
 from executorch.backends.arm.constants import NCHW_ORDER, NNCHW_ORDER, NNNCHW_ORDER
 from executorch.backends.arm.tosa.dialect.shape import is_shape_op_node
-from executorch.backends.arm.tosa.mapping import TosaSpecialDtype
 from executorch.exir import ExportedProgram
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.pass_base import ExportPass, PassResult
@@ -472,58 +471,16 @@ class ToTosaMemoryFormatPass(ArmPass):
         ) and ToTosaMemoryFormatPass.memory_format_differs(output_shape, output_sr):
             ToTosaMemoryFormatPass.insert_output_transpose(node, graph_module)
 
-    @staticmethod
-    def _is_input_channels_last(input_node: torch.fx.Node, cl_order: list[int]) -> bool:
-        """Return True if *input_node* is already in channels-last order.
-
-        Only when the input is in NHWC does a cl_order/cl_inv permute duplicate
-        the tosa_dim_order annotation.  When the input is in NCHW (e.g. from a
-        placeholder or non-spatial op) the permute is the model's intended
-        computation and must be kept.
-
-        """
-        input_dim_order = input_node.meta.get("tosa_dim_order")
-        if input_dim_order is None:
-            return True
-        return list(input_dim_order) == cl_order
-
-    @staticmethod
-    def _is_semantic_permute(input_node: torch.fx.Node) -> bool:
-        """Return True if the permute's input traces back to a shape-
-        manipulation op through transpose/permute nodes.
-
-        Walk upstream through tosa.TRANSPOSE and aten.permute_copy nodes
-        (chained permutes arise from decomposition passes, e.g. unfold ->
-        as_strided + movedim -> permute_copy).  If a shape-manipulation op is
-        found, the permute is semantic, not a format conversion.
-
-        """
-        upstream: torch.fx.Node | object = input_node
-        while isinstance(upstream, torch.fx.Node) and upstream.target in (
-            exir_ops.backend.tosa.TRANSPOSE.default,
-            exir_ops.edge.aten.permute_copy.default,
-            exir_ops.edge.aten.permute.default,
-        ):
-            upstream = upstream.args[0]
-        return isinstance(upstream, torch.fx.Node) and upstream.target in (
-            exir_ops.edge.aten.view_copy.default,
-            exir_ops.edge.aten.reshape.default,
-            exir_ops.edge.aten.as_strided.default,
-            exir_ops.edge.aten.as_strided_copy.default,
-        )
-
     def _try_replace_redundant_permute(
         self, node: torch.fx.Node, graph_module: torch.fx.GraphModule
     ) -> bool:
-        """Remove a permute_copy if it duplicates tosa_dim_order.
+        """Erase a canceling permute pair (cl_order → cl_inv or vice versa).
 
-        When a permute_copy's permutation matches the channels-last order
-        (or its inverse) AND the input is already in NHWC dim_order, the
-        permute does the same NCHW<>NHWC conversion that tosa_dim_order
-        already handles — keeping both would double-convert.  Remove the
-        permute by wiring its users directly to its input.
+        When two adjacent permute_copy nodes have complementary channels-last
+        permutations, they compose to identity and both are erased.  The
+        second permute's users are rewired to the first permute's input.
 
-        Returns ``True`` if the node was removed.
+        Returns ``True`` if the pair was removed.
 
         """
         if node.target not in (
@@ -550,29 +507,31 @@ class ToTosaMemoryFormatPass(ArmPass):
         if not isinstance(input_node, torch.fx.Node):
             return False
 
-        if not self._is_input_channels_last(input_node, cl_order):
+        # Guard: only erase when the sole user is another permute with the
+        # complementary perm (cl_order ↔ cl_inv).  This ensures permutes are
+        # only erased as canceling pairs, preserving graph-level shapes for
+        # all other downstream consumers.
+        if len(node.users) != 1:
+            return False
+        user_node = next(iter(node.users))
+        if not isinstance(user_node, torch.fx.Node):
+            return False
+        if user_node.target not in (
+            exir_ops.edge.aten.permute_copy.default,
+            exir_ops.edge.aten.permute.default,
+        ):
+            return False
+        user_perm = user_node.args[1] if len(user_node.args) > 1 else None
+        if not isinstance(user_perm, (list, tuple)):
+            return False
+        complement = cl_inv if perm == cl_order else cl_order
+        if list(user_perm) != complement:
             return False
 
-        if self._is_semantic_permute(input_node):
-            return False
-
-        output_shape = list(node.meta["val"].shape)
-        with graph_module.graph.inserting_before(node):
-            const_shape_node = graph_module.graph.call_function(
-                exir_ops.backend.tosa.CONST_SHAPE.default,
-                (output_shape,),
-            )
-            const_shape_node.meta["val"] = output_shape
-            const_shape_node.meta["tosa_dim_order"] = node.meta.get(
-                "tosa_dim_order", tuple(range(rank))
-            )
-            const_shape_node.meta[TosaSpecialDtype.meta_key()] = TosaSpecialDtype.SHAPE
-            view_node = graph_module.graph.call_function(
-                exir_ops.edge.aten.view_copy.default,
-                (input_node, const_shape_node),
-            )
-            view_node.meta = dict(node.meta)
-        node.replace_all_uses_with(view_node)
+        # Erase both permutes: rewire the second permute's users to use
+        # the first permute's input, then remove both nodes.
+        user_node.replace_all_uses_with(input_node)
+        graph_module.graph.erase_node(user_node)
         graph_module.graph.erase_node(node)
         return True
 
